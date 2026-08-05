@@ -33,9 +33,12 @@ TIMETABLE_URL = f"{BASE_URL}/timetable/"
 
 # Заголовки для имитации браузера
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "Accept": "text/html,application/xhtml+xml",
-    "Accept-Language": "ru-RU,ru;q=0.9",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "ru-RU,ru;q=0.8,en-US;q=0.5,en;q=0.3",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
 }
 
 # Инициализация бота с увеличенным таймаутом
@@ -107,9 +110,10 @@ async def fetch_with_retry(url, max_retries=3):
 async def fetch_institutes():
     """Получение списка институтов"""
     if cache.is_valid("institutes"):
+        logger.info("Using cached institutes")
         return cache.institutes
     
-    logger.info("Fetching institutes...")
+    logger.info("Fetching institutes from website...")
     html = await fetch_with_retry(TIMETABLE_URL)
     if not html:
         logger.warning("Failed to fetch institutes, using fallback")
@@ -118,23 +122,37 @@ async def fetch_institutes():
     soup = BeautifulSoup(html, 'html.parser')
     institutes = []
     
+    # Ищем все возможные ссылки на институты
     for link in soup.find_all('a', href=True):
         href = link.get('href', '')
-        if '/timetable/students/' in href:
+        text = link.get_text(strip=True)
+        
+        # Разные форматы ссылок на институты
+        if '/timetable/students/' in href and text:
             match = re.search(r'/students/(\d+)/?', href)
             if match:
                 inst_id = match.group(1)
-                name = link.get_text(strip=True)
-                if name and len(name) > 2:
-                    if not any(i['id'] == inst_id for i in institutes):
-                        institutes.append({'id': inst_id, 'name': name[:50]})
+                if text and len(text) > 2 and not any(i['id'] == inst_id for i in institutes):
+                    institutes.append({'id': inst_id, 'name': text[:50]})
+    
+    # Если не нашли через ссылки, ищем в других элементах
+    if not institutes:
+        for element in soup.find_all(['div', 'li', 'option'], class_=re.compile(r'institute|faculty', re.I)):
+            text = element.get_text(strip=True)
+            link = element.find('a')
+            if link:
+                href = link.get('href', '')
+                match = re.search(r'/students/(\d+)/?', href)
+                if match and text:
+                    institutes.append({'id': match.group(1), 'name': text[:50]})
     
     if institutes:
         cache.institutes = institutes
         cache.update("institutes")
-        logger.info(f"Found {len(institutes)} institutes")
+        logger.info(f"Found {len(institutes)} institutes: {[i['name'] for i in institutes[:3]]}...")
         return institutes
     
+    logger.warning("No institutes found on website, using fallback")
     return get_fallback_institutes()
 
 def get_fallback_institutes():
@@ -156,28 +174,146 @@ async def fetch_groups(inst_id):
     """Получение списка групп института"""
     cache_key = f"groups_{inst_id}"
     if cache.is_valid(cache_key) and inst_id in cache.groups:
+        logger.info(f"Using cached groups for institute {inst_id}")
         return cache.groups[inst_id]
     
     logger.info(f"Fetching groups for institute {inst_id}")
     url = f"{BASE_URL}/timetable/students/{inst_id}/"
     html = await fetch_with_retry(url)
+    
     if not html:
+        logger.error(f"No HTML received for institute {inst_id}")
         return []
     
     soup = BeautifulSoup(html, 'html.parser')
     groups = []
     
+    # Способ 1: Ищем ссылки с параметром group
+    logger.info("Trying method 1: links with group parameter")
     for link in soup.find_all('a', href=True):
         href = link.get('href', '')
         if 'group=' in href:
             group_name = link.get_text(strip=True)
-            if group_name and group_name not in groups:
+            if group_name and group_name not in groups and len(group_name) > 1:
                 groups.append(group_name)
     
+    # Способ 2: Ищем все ссылки с цифрами в тексте
+    if not groups:
+        logger.info("Trying method 2: links with numbers in text")
+        for link in soup.find_all('a', href=True):
+            text = link.get_text(strip=True)
+            href = link.get('href', '')
+            if text and re.search(r'\d', text) and len(text) < 30 and len(text) > 2:
+                if '/timetable/' in href or 'group=' in href or 'students/' in href:
+                    if text not in groups:
+                        groups.append(text)
+    
+    # Способ 3: Ищем в элементах списка или таблицы
+    if not groups:
+        logger.info("Trying method 3: list items and table rows")
+        for element in soup.find_all(['li', 'td', 'option', 'div'], class_=re.compile(r'group|specialty', re.I)):
+            text = element.get_text(strip=True)
+            if text and re.search(r'\d', text) and len(text) < 30 and len(text) > 2:
+                if text not in groups:
+                    groups.append(text)
+    
+    # Способ 4: Пробуем найти группы через JavaScript
+    if not groups:
+        logger.info("Trying method 4: JavaScript data")
+        scripts = soup.find_all('script')
+        for script in scripts:
+            if script.string:
+                # Ищем массивы с группами
+                matches = re.findall(r'["\']([\d][^"\']{2,20})["\']', script.string)
+                for match in matches:
+                    if re.search(r'[а-яА-Я]', match) or re.search(r'[\d]', match):
+                        if match not in groups and len(match) < 30:
+                            groups.append(match)
+    
+    # Способ 5: Пробуем API endpoint
+    if not groups:
+        logger.info("Trying method 5: API endpoint")
+        api_urls = [
+            f"{BASE_URL}/timetable/api/students/{inst_id}/groups/",
+            f"{BASE_URL}/timetable/api/groups/?faculty={inst_id}",
+            f"{BASE_URL}/api/timetable/groups/?faculty_id={inst_id}"
+        ]
+        
+        for api_url in api_urls:
+            try:
+                async with httpx.AsyncClient(follow_redirects=True, headers=HEADERS, timeout=10.0) as client:
+                    response = await client.get(api_url)
+                    if response.status_code == 200:
+                        try:
+                            data = response.json()
+                            if isinstance(data, list):
+                                for item in data:
+                                    if isinstance(item, dict):
+                                        group_name = item.get('name') or item.get('title') or str(item)
+                                    else:
+                                        group_name = str(item)
+                                    if group_name and group_name not in groups:
+                                        groups.append(group_name)
+                            elif isinstance(data, dict):
+                                for key, value in data.items():
+                                    if isinstance(value, str) and value not in groups:
+                                        groups.append(value)
+                                    elif isinstance(value, list):
+                                        for item in value:
+                                            if str(item) not in groups:
+                                                groups.append(str(item))
+                            if groups:
+                                break
+                        except:
+                            continue
+            except:
+                continue
+    
+    # Способ 6: Пробуем прямые ссылки на известные группы
+    if not groups:
+        logger.info("Trying method 6: common group patterns")
+        common_groups = [
+            "9.501-1", "9.501-2", "9.502-1", "9.502-2",
+            "4.101-1", "4.101-2", "4.102-1", "4.102-2",
+            "1.201-1", "1.201-2", "1.202-1", "1.202-2",
+            "5.301-1", "5.301-2", "5.302-1", "5.302-2",
+            "8.401-1", "8.401-2", "8.402-1", "8.402-2"
+        ]
+        
+        for group in common_groups:
+            test_url = f"{BASE_URL}/timetable/?group={group}"
+            try:
+                async with httpx.AsyncClient(follow_redirects=True, headers=HEADERS, timeout=5.0) as client:
+                    response = await client.head(test_url)
+                    if response.status_code == 200:
+                        groups.append(group)
+            except:
+                continue
+        
+        if groups:
+            logger.info(f"Found {len(groups)} groups via direct links")
+    
+    # Очистка и сортировка результатов
     if groups:
-        cache.groups[inst_id] = sorted(set(groups))
+        clean_groups = []
+        for g in groups:
+            g = g.strip()
+            # Пропускаем слишком длинные или короткие строки
+            if 2 < len(g) < 30:
+                # Пропускаем строки, которые явно не являются названиями групп
+                if not g.startswith(('http', 'www', 'javascript', 'mailto')):
+                    clean_groups.append(g)
+        
+        groups = sorted(set(clean_groups))
+        cache.groups[inst_id] = groups
         cache.update(cache_key)
-        logger.info(f"Found {len(groups)} groups for institute {inst_id}")
+        logger.info(f"Successfully found {len(groups)} groups for institute {inst_id}")
+        if groups:
+            logger.info(f"Sample groups: {groups[:5]}")
+    else:
+        logger.warning(f"No groups found for institute {inst_id} after all methods")
+        cache.groups[inst_id] = []
+        cache.update(cache_key)
     
     return cache.groups.get(inst_id, [])
 
@@ -191,29 +327,55 @@ async def get_schedule(query):
         return "❌ Сервер АлтГУ временно недоступен. Попробуйте позже."
     
     soup = BeautifulSoup(html, 'html.parser')
-    text_parts = []
     
-    # Ищем расписание
-    days = soup.find_all(['div', 'table'], class_=re.compile(r'day|timetable', re.I))
-    for day in days[:7]:
-        day_text = day.get_text(separator='\n', strip=True)
-        if len(day_text) > 20:
-            text_parts.append(day_text[:500])
+    # Ищем расписание в разных форматах
+    schedule_parts = []
     
-    if text_parts:
+    # Поиск по классам
+    for class_name in ['day', 'timetable', 'schedule', 'raspisanie', 'pair', 'lesson']:
+        elements = soup.find_all(['div', 'table', 'tr', 'li'], class_=re.compile(class_name, re.I))
+        for element in elements[:14]:  # Максимум 14 элементов (2 недели)
+            text = element.get_text(separator='\n', strip=True)
+            if text and len(text) > 15 and query.lower() in text.lower():
+                schedule_parts.append(text[:500])
+            elif text and len(text) > 15 and len(schedule_parts) < 14:
+                # Добавляем даже если query не найден, но текст похож на расписание
+                if re.search(r'\d{1,2}[:.]\d{2}', text) or 'пара' in text.lower():
+                    schedule_parts.append(text[:500])
+    
+    # Если нашли структурированное расписание
+    if schedule_parts:
         result = f"📅 <b>Расписание для:</b> <code>{query}</code>\n\n"
-        for i, part in enumerate(text_parts, 1):
-            result += f"<b>День {i}:</b>\n{part}\n\n"
+        for i, part in enumerate(schedule_parts[:14], 1):
+            result += f"<b>Пара {i}:</b>\n{part}\n{'─' * 30}\n"
         return result
     
-    # Поиск по тексту
+    # Поиск по всему тексту страницы
     all_text = soup.get_text(separator='\n', strip=True)
-    lines = [line.strip() for line in all_text.split('\n') if query.lower() in line.lower()]
+    lines = all_text.split('\n')
     
-    if lines:
-        return f"📅 <b>Расписание для:</b> <code>{query}</code>\n\n" + '\n'.join(lines[:20])
+    # Ищем строки, содержащие запрос
+    relevant_lines = []
+    for line in lines:
+        line = line.strip()
+        if line and query.lower() in line.lower():
+            relevant_lines.append(line)
     
-    return f"📅 <b>Расписание для:</b> <code>{query}</code>\n\n❌ Не найдено на сайте."
+    if relevant_lines:
+        result = f"📅 <b>Расписание для:</b> <code>{query}</code>\n\n"
+        result += '\n'.join(relevant_lines[:20])
+        return result
+    
+    # Если ничего не нашли
+    return (
+        f"📅 <b>Расписание для:</b> <code>{query}</code>\n\n"
+        f"❌ Расписание не найдено на сайте АлтГУ.\n\n"
+        f"🔍 <i>Возможные причины:</i>\n"
+        f"• Неправильный номер группы\n"
+        f"• Расписание ещё не опубликовано\n"
+        f"• Изменился формат номера группы\n\n"
+        f"💡 <i>Проверьте номер группы в личном кабинете АлтГУ</i>"
+    )
 
 # Обработчики команд
 @dp.message(CommandStart())
@@ -222,7 +384,8 @@ async def cmd_start(message: types.Message):
     logger.info(f"User {message.from_user.id} started bot")
     await message.answer(
         "👋 <b>Привет!</b> Я бот расписания АлтГУ.\n\n"
-        "Выберите действие в меню:",
+        "Я помогу узнать расписание занятий.\n"
+        "Выберите действие в меню ниже:",
         parse_mode="HTML",
         reply_markup=get_main_keyboard()
     )
@@ -232,14 +395,21 @@ async def cmd_help(message: types.Message):
     """Обработчик команды /help"""
     await message.answer(
         "<b>📚 Как пользоваться ботом:</b>\n\n"
+        "<b>Способ 1 (меню):</b>\n"
         "1️⃣ Нажмите <b>📅 Расписание</b>\n"
-        "2️⃣ Выберите тип расписания\n"
+        "2️⃣ Выберите <b>🎓 Студенты</b>\n"
         "3️⃣ Выберите институт и группу\n\n"
-        "<b>Прямые команды:</b>\n"
-        "• /schedule 9.501-1 - расписание группы\n"
-        "• /schedule Иванов И.И. - преподаватель\n"
-        "• /schedule 327М - аудитория\n"
-        "• /start - перезапуск бота",
+        "<b>Способ 2 (команда):</b>\n"
+        "Отправьте команду:\n"
+        "<code>/schedule НомерГруппы</code>\n\n"
+        "<b>Примеры:</b>\n"
+        "• /schedule 9.501-1\n"
+        "• /schedule 4.101-2\n"
+        "• /schedule Иванов И.И.\n"
+        "• /schedule 327М\n\n"
+        "<b>Другие команды:</b>\n"
+        "/start - перезапуск бота\n"
+        "/help - эта справка",
         parse_mode="HTML"
     )
 
@@ -248,7 +418,14 @@ async def cmd_schedule(message: types.Message):
     """Обработчик команды /schedule"""
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2:
-        await message.answer("❌ Укажите группу/преподавателя/аудиторию\nПример: /schedule 9.501-1")
+        await message.answer(
+            "❌ Укажите группу, преподавателя или аудиторию\n\n"
+            "<b>Примеры:</b>\n"
+            "<code>/schedule 9.501-1</code> - группа\n"
+            "<code>/schedule Иванов И.И.</code> - преподаватель\n"
+            "<code>/schedule 327М</code> - аудитория",
+            parse_mode="HTML"
+        )
         return
     
     query = parts[1].strip()
@@ -261,7 +438,7 @@ async def cmd_schedule(message: types.Message):
     try:
         await msg.edit_text(schedule, parse_mode="HTML")
     except Exception as e:
-        logger.error(f"Error sending schedule: {e}")
+        logger.error(f"Error editing message: {e}")
         await msg.delete()
         # Разбиваем длинные сообщения
         if len(schedule) > 4000:
@@ -276,7 +453,9 @@ async def btn_schedule(message: types.Message):
     """Кнопка 'Расписание'"""
     logger.info(f"User {message.from_user.id} pressed 'Расписание'")
     await message.answer(
-        "Выберите тип расписания:",
+        "<b>📅 Расписание занятий АлтГУ</b>\n\n"
+        "Выберите категорию:",
+        parse_mode="HTML",
         reply_markup=get_schedule_menu()
     )
 
@@ -285,26 +464,17 @@ async def btn_website(message: types.Message):
     """Кнопка 'Сайт АлтГУ'"""
     logger.info(f"User {message.from_user.id} pressed 'Сайт АлтГУ'")
     await message.answer(
-        f"🔗 Официальный сайт расписания АлтГУ:\n{TIMETABLE_URL}"
+        f"🔗 <b>Официальный сайт расписания АлтГУ:</b>\n\n"
+        f"{TIMETABLE_URL}\n\n"
+        f"<i>На сайте можно посмотреть расписание всех групп, преподавателей и аудиторий</i>",
+        parse_mode="HTML"
     )
 
 @dp.message(F.text == "❓ Помощь")
 async def btn_help(message: types.Message):
     """Кнопка 'Помощь'"""
     logger.info(f"User {message.from_user.id} pressed 'Помощь'")
-    await message.answer(
-        "<b>📚 Как пользоваться ботом:</b>\n\n"
-        "1️⃣ Нажмите <b>📅 Расписание</b>\n"
-        "2️⃣ Выберите тип расписания\n"
-        "3️⃣ Выберите институт и группу\n\n"
-        "<b>Прямые команды:</b>\n"
-        "• /schedule 9.501-1 - расписание группы\n"
-        "• /schedule Иванов И.И. - преподаватель\n"
-        "• /schedule 327М - аудитория\n"
-        "• /help - эта справка\n"
-        "• /start - перезапуск бота",
-        parse_mode="HTML"
-    )
+    await cmd_help(message)
 
 # Обработчики callback-запросов (inline кнопки)
 @dp.callback_query(F.data == "type_students")
@@ -343,10 +513,13 @@ async def cb_teachers(callback: CallbackQuery):
     
     await callback.message.edit_text(
         "👨‍🏫 <b>Расписание преподавателя</b>\n\n"
-        "Отправьте команду:\n"
+        "Отправьте команду с фамилией и инициалами:\n"
         "<code>/schedule Фамилия И.О.</code>\n\n"
-        "Пример:\n"
-        "<code>/schedule Иванов И.И.</code>",
+        "<b>Примеры:</b>\n"
+        "• <code>/schedule Иванов И.И.</code>\n"
+        "• <code>/schedule Петрова А.С.</code>\n\n"
+        "<i>Можно указать только фамилию:</i>\n"
+        "• <code>/schedule Иванов</code>",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔙 Назад в меню", callback_data="back_to_menu")]
@@ -361,10 +534,13 @@ async def cb_rooms(callback: CallbackQuery):
     
     await callback.message.edit_text(
         "🏛 <b>Расписание аудитории</b>\n\n"
-        "Отправьте команду:\n"
+        "Отправьте команду с номером аудитории:\n"
         "<code>/schedule НомерАудитории</code>\n\n"
-        "Пример:\n"
-        "<code>/schedule 327М</code>",
+        "<b>Примеры:</b>\n"
+        "• <code>/schedule 327М</code>\n"
+        "• <code>/schedule 215</code>\n"
+        "• <code>/schedule 401Л</code>\n\n"
+        "<i>Номер аудитории можно найти в расписании группы</i>",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔙 Назад в меню", callback_data="back_to_menu")]
@@ -383,14 +559,26 @@ async def cb_institute(callback: CallbackQuery):
     groups = await fetch_groups(inst_id)
     
     if not groups:
+        # Если группы не найдены, предлагаем ручной ввод
         await callback.message.edit_text(
-            "❌ Не удалось загрузить список групп.\n\n"
-            "Вы можете использовать прямую команду:\n"
+            "❌ Автоматический список групп временно недоступен.\n\n"
+            "🔍 <b>Вы можете найти расписание вручную:</b>\n\n"
+            "1️⃣ Отправьте команду:\n"
             "<code>/schedule НомерГруппы</code>\n\n"
-            "Например: <code>/schedule 9.501-1</code>",
+            "2️⃣ Или нажмите кнопку ниже и введите группу:\n\n"
+            "<b>Примеры номеров групп:</b>\n"
+            "• 9.501-1\n"
+            "• 4.101-2\n"
+            "• 1.201-1\n\n"
+            "<i>Точный номер группы можно узнать:\n"
+            "- В личном кабинете АлтГУ\n"
+            "- В зачетной книжке\n"
+            "- У старосты группы</i>",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔙 К институтам", callback_data="type_students")]
+                [InlineKeyboardButton(text="🔍 Ввести группу вручную", switch_inline_query_current_chat="/schedule ")],
+                [InlineKeyboardButton(text="🔙 К институтам", callback_data="type_students")],
+                [InlineKeyboardButton(text="🏠 В главное меню", callback_data="back_to_menu")]
             ])
         )
         return
@@ -401,17 +589,22 @@ async def cb_institute(callback: CallbackQuery):
         row = []
         for group in groups[i:i+2]:
             row.append(InlineKeyboardButton(
-                text=group[:20],
+                text=group[:25],
                 callback_data=f"group_{group}"
             ))
         keyboard.append(row)
     
+    # Навигационные кнопки
     keyboard.append([
-        InlineKeyboardButton(text="🔙 К институтам", callback_data="type_students")
+        InlineKeyboardButton(text="🔙 К институтам", callback_data="type_students"),
+        InlineKeyboardButton(text="🏠 В меню", callback_data="back_to_menu")
     ])
     
     await callback.message.edit_text(
-        f"👥 <b>Выберите группу:</b>\nНайдено групп: {len(groups)}",
+        f"👥 <b>Выберите группу:</b>\n"
+        f"📊 Найдено групп: {len(groups)}\n\n"
+        f"<i>Если вашей группы нет в списке, используйте:</i>\n"
+        f"<code>/schedule НомерГруппы</code>",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
     )
@@ -449,7 +642,9 @@ async def cb_back_to_menu(callback: CallbackQuery):
     logger.info(f"User {callback.from_user.id} back to menu")
     
     await callback.message.edit_text(
-        "Выберите тип расписания:",
+        "<b>📅 Расписание занятий АлтГУ</b>\n\n"
+        "Выберите категорию:",
+        parse_mode="HTML",
         reply_markup=get_schedule_menu()
     )
 
@@ -458,22 +653,41 @@ async def cb_back_to_menu(callback: CallbackQuery):
 async def handle_unknown(message: types.Message):
     """Обработчик для неизвестных сообщений"""
     logger.info(f"Unknown message from {message.from_user.id}: {message.text}")
-    await message.answer(
-        "Используйте кнопки меню или команды:\n"
-        "/start - главное меню\n"
-        "/schedule - поиск расписания\n"
-        "/help - справка"
-    )
+    
+    # Проверяем, может это номер группы?
+    if re.match(r'^[\d]', message.text):
+        # Возможно пользователь ввел номер группы без команды
+        await message.answer(
+            f"🔍 Возможно, вы хотели найти расписание?\n\n"
+            f"Используйте команду:\n"
+            f"<code>/schedule {message.text}</code>\n\n"
+            f"Или нажмите на кнопку меню ниже.",
+            parse_mode="HTML",
+            reply_markup=get_main_keyboard()
+        )
+    else:
+        await message.answer(
+            "🤔 Я не понял ваш запрос.\n\n"
+            "Используйте кнопки меню или команды:\n"
+            "/start - главное меню\n"
+            "/schedule - поиск расписания\n"
+            "/help - справка",
+            reply_markup=get_main_keyboard()
+        )
 
 # Веб-сервер для Amvera
 async def handle_health(request):
     """Эндпоинт для проверки работоспособности"""
     return web.Response(text="Bot is running")
 
+async def handle_root(request):
+    """Корневой эндпоинт"""
+    return web.Response(text="AltSU Schedule Bot is active!")
+
 async def start_web_server():
     """Запуск веб-сервера"""
     app = web.Application()
-    app.router.add_get("/", handle_health)
+    app.router.add_get("/", handle_root)
     app.router.add_get("/health", handle_health)
     
     runner = web.AppRunner(app)
