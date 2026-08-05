@@ -1,0 +1,12 @@
+amvera:
+  cpu: 0.1
+  memory: 100M
+  storage: 2G
+build:
+  language: python
+  packageManager: pip
+  startupCommand: python main.py
+run:
+  persistence:,
+    - mount: /data
+      path: /data
