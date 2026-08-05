@@ -27,6 +27,20 @@ HEADERS = {
 
 USER_GROUPS_CACHE = {}
 
+# Запасной базовый список институтов АлтГУ (если сайт временно недоступен)
+FALLBACK_INSTITUTES = [
+    {"id": "3", "name": "Институт географии (ИНГЕО)"},
+    {"id": "1", "name": "Биологии и биотехнологии (ИББ)"},
+    {"id": "2", "name": "Гуманитарных наук (ИГН)"},
+    {"id": "4", "name": "Исторический (ИИМО)"},
+    {"id": "5", "name": "ИХиХФТ"},
+    {"id": "6", "name": "ИЦТЭФ"},
+    {"id": "7", "name": "Колледж АГУ (СПО)"},
+    {"id": "8", "name": "Математики и инф.технологий (ИМИИТ)"},
+    {"id": "9", "name": "МИЭМИС (ЭФ)"},
+    {"id": "10", "name": "Юридический институт (ЮИ)"}
+]
+
 main_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📅 Выбрать расписание")],
@@ -45,52 +59,55 @@ def get_main_schedule_menu():
     )
 
 async def fetch_institutes():
+    """Парсит институты с сайта АлтГУ с фоллбэком"""
     url = "https://www.asu.ru/timetable/"
     try:
-        async with httpx.AsyncClient(follow_redirects=True, headers=HEADERS, timeout=15.0) as client:
+        async with httpx.AsyncClient(follow_redirects=True, headers=HEADERS, timeout=10.0) as client:
             response = await client.get(url)
-            if response.status_code != 200:
-                return []
-            
-            soup = BeautifulSoup(response.text, "html.parser")
-            institutes = []
-            
-            inst_links = soup.find_all("a", href=re.compile(r"/timetable/students/\d+/"))
-            for link in inst_links:
-                name = link.get_text(strip=True)
-                href = link.get("href")
-                match = re.search(r"/timetable/students/(\d+)/", href)
-                if match and name:
-                    inst_id = match.group(1)
-                    if not any(i['id'] == inst_id for i in institutes):
-                        institutes.append({"id": inst_id, "name": name})
-            
-            return institutes
+            if response.status_code == 200:
+                soup = BeautifulSoup(response.text, "html.parser")
+                institutes = []
+                
+                # Ищем любые ссылки вида /timetable/students/... или теги выпадающих списков
+                links = soup.find_all("a", href=re.compile(r"/timetable/students/"))
+                for link in links:
+                    name = link.get_text(strip=True)
+                    href = link.get("href", "")
+                    match = re.search(r"/students/(\d+)/", href)
+                    if match and name:
+                        inst_id = match.group(1)
+                        if not any(i['id'] == inst_id for i in institutes):
+                            institutes.append({"id": inst_id, "name": name})
+                
+                if institutes:
+                    return institutes
     except Exception as e:
-        logging.error(f"Ошибка при получении институтов: {e}")
-        return []
+        logging.error(f"Ошибка парсинга институтов: {e}")
+        
+    return FALLBACK_INSTITUTES
 
 async def fetch_groups_by_institute(inst_id: str):
+    """Парсит группы конкретного института"""
     url = f"https://www.asu.ru/timetable/students/{inst_id}/"
     try:
-        async with httpx.AsyncClient(follow_redirects=True, headers=HEADERS, timeout=15.0) as client:
+        async with httpx.AsyncClient(follow_redirects=True, headers=HEADERS, timeout=10.0) as client:
             response = await client.get(url)
-            if response.status_code != 200:
-                return []
-            
-            soup = BeautifulSoup(response.text, "html.parser")
-            groups = []
-            
-            group_links = soup.find_all("a", href=re.compile(r"\?group="))
-            for link in group_links:
-                g_name = link.get_text(strip=True)
-                if g_name and g_name not in groups:
-                    groups.append(g_name)
-                    
-            return sorted(groups)
+            if response.status_code == 200:
+                soup = BeautifulSoup(response.text, "html.parser")
+                groups = []
+                
+                group_links = soup.find_all("a", href=re.compile(r"\?group="))
+                for link in group_links:
+                    g_name = link.get_text(strip=True)
+                    if g_name and g_name not in groups:
+                        groups.append(g_name)
+                        
+                if groups:
+                    return sorted(groups)
     except Exception as e:
-        logging.error(f"Ошибка при получении групп: {e}")
-        return []
+        logging.error(f"Ошибка получения групп: {e}")
+        
+    return []
 
 def build_institutes_keyboard(institutes):
     keyboard = []
@@ -103,7 +120,7 @@ def build_institutes_keyboard(institutes):
 
 def build_groups_keyboard(groups, page: int = 0):
     items_per_page = 14
-    total_pages = (len(groups) + items_per_page - 1) // items_per_page
+    total_pages = max(1, (len(groups) + items_per_page - 1) // items_per_page)
     
     start_idx = page * items_per_page
     end_idx = start_idx + items_per_page
@@ -134,7 +151,7 @@ def build_groups_keyboard(groups, page: int = 0):
 async def get_schedule(query_code: str) -> str:
     url = f"https://www.asu.ru/timetable/?group={query_code}"
     try:
-        async with httpx.AsyncClient(follow_redirects=True, headers=HEADERS, timeout=15.0) as client:
+        async with httpx.AsyncClient(follow_redirects=True, headers=HEADERS, timeout=12.0) as client:
             response = await client.get(url)
             if response.status_code != 200:
                 return "⚠️ Не удалось связаться с сервером АлтГУ."
@@ -170,7 +187,9 @@ async def get_schedule(query_code: str) -> str:
         logging.error(f"Ошибка парсинга: {e}")
         return f"📅 <b>Запрос: {query_code}</b>\n\nℹ️ Ошибка подключения к серверу АлтГУ."
 
+# ---------------------------------------------------------------------------
 # Хэндлеры
+# ---------------------------------------------------------------------------
 @dp.message(CommandStart())
 async def start_cmd(message: types.Message):
     await message.answer("👋 <b>Добро пожаловать в бот расписания АлтГУ!</b>\n\nВыберите нужный раздел из меню ниже:", parse_mode="HTML", reply_markup=main_keyboard)
@@ -185,7 +204,7 @@ async def open_website(message: types.Message):
 
 @dp.message(F.text == "❓ Помощь")
 async def help_cmd(message: types.Message):
-    await message.answer("<b>Как пользоваться ботом:</b>\n\n1. Нажмите <b>📅 Выбрать расписание</b>.\n2. Выберите ваш институт и группу.\n\nИли введите группу вручную:\n<code>/schedule 9.501-1</code>", parse_mode="HTML")
+    await message.answer("<b>Как пользоваться ботом:</b>\n\n1. Нажмите <b>📅 Выбрать расписание</b>.\n2. Выберите ваш институт и группу.\n\nИли введите команду напрямую:\n<code>/schedule 9.501-1</code>", parse_mode="HTML")
 
 @dp.message(Command("schedule"))
 async def schedule_cmd(message: types.Message):
@@ -199,6 +218,7 @@ async def schedule_cmd(message: types.Message):
     await status_msg.delete()
     await message.answer(schedule, parse_mode="HTML")
 
+# Callback-события
 @dp.callback_query(F.data == "back_to_main_menu")
 async def back_to_main(callback: CallbackQuery):
     await callback.message.edit_text("<b>Расписание занятий АлтГУ</b>\nВыберите категорию:", parse_mode="HTML", reply_markup=get_main_schedule_menu())
@@ -206,13 +226,35 @@ async def back_to_main(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "type_students")
 async def type_students_handler(callback: CallbackQuery):
-    await callback.message.edit_text("⏳ Загружаю список институтов с сайта АлтГУ...")
+    await callback.message.edit_text("⏳ Загружаю список институтов...")
     institutes = await fetch_institutes()
-    if not institutes:
-        await callback.message.edit_text("⚠️ Не удалось загрузить список институтов. Введите номер группы вручную через /schedule.")
-        await callback.answer()
-        return
-    await callback.message.edit_text("<b>Шаг 1. Выбор учебного подразделения / института:</b>", parse_mode="HTML", reply_markup=build_institutes_keyboard(institutes))
+    await callback.message.edit_text(
+        "<b>Шаг 1. Выбор учебного подразделения / института:</b>",
+        parse_mode="HTML",
+        reply_markup=build_institutes_keyboard(institutes)
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "type_teachers")
+async def type_teachers_handler(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "👨‍🏫 <b>Поиск расписания преподавателя</b>\n\n"
+        "Для просмотра расписания отправьте команду со структурой:\n"
+        "<code>/schedule Фамилия И.О.</code>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main_menu")]])
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "type_rooms")
+async def type_rooms_handler(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "🏛 <b>Поиск расписания в аудитории</b>\n\n"
+        "Для просмотра расписания отправьте номер аудитории командой:\n"
+        "<code>/schedule 404 Л</code>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main_menu")]])
+    )
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("inst_"))
@@ -220,10 +262,17 @@ async def inst_selected_handler(callback: CallbackQuery):
     inst_id = callback.data.split("_")[1]
     await callback.message.edit_text("⏳ Загружаю список групп института...")
     groups = await fetch_groups_by_institute(inst_id)
+    
     if not groups:
-        await callback.message.edit_text("⚠️ Группы для данного института не найдены.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="type_students")]]))
+        await callback.message.edit_text(
+            "ℹ️ Автоматический список групп недоступен.\n"
+            "Отправьте номер вашей группы командой:\n<code>/schedule 9.501-1</code>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад к институтам", callback_data="type_students")]])
+        )
         await callback.answer()
         return
+
     USER_GROUPS_CACHE[callback.from_user.id] = groups
     await callback.message.edit_text("<b>Шаг 2. Выбор группы:</b>", parse_mode="HTML", reply_markup=build_groups_keyboard(groups, page=0))
     await callback.answer()
