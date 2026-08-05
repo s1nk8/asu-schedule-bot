@@ -58,33 +58,45 @@ def get_main_schedule_menu():
         ]
     )
 
-async def fetch_institutes():
-    """Парсит институты с сайта АлтГУ с фоллбэком"""
+async async def fetch_institutes():
+    """Парсит институты с сайта АлтГУ с расширенным логированием и фоллбэком"""
     url = "https://www.asu.ru/timetable/"
     try:
         async with httpx.AsyncClient(follow_redirects=True, headers=HEADERS, timeout=10.0) as client:
             response = await client.get(url)
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.text, "html.parser")
-                institutes = []
-                
-                # Ищем любые ссылки вида /timetable/students/... или теги выпадающих списков
-                links = soup.find_all("a", href=re.compile(r"/timetable/students/"))
-                for link in links:
-                    name = link.get_text(strip=True)
-                    href = link.get("href", "")
-                    match = re.search(r"/students/(\d+)/", href)
-                    if match and name:
-                        inst_id = match.group(1)
-                        if not any(i['id'] == inst_id for i in institutes):
-                            institutes.append({"id": inst_id, "name": name})
-                
-                if institutes:
-                    return institutes
+            
+            # Логируем статус-код, если он не 200
+            if response.status_code != 200:
+                logging.error(f"❌ Ошибка доступа к главной странице {url}. Статус код: {response.status_code}")
+                return FALLBACK_INSTITUTES
+
+            soup = BeautifulSoup(response.text, "html.parser")
+            institutes = []
+            
+            # Ищем любые ссылки вида /timetable/students/...
+            links = soup.find_all("a", href=re.compile(r"/timetable/students/"))
+            for link in links:
+                name = link.get_text(strip=True)
+                href = link.get("href", "")
+                match = re.search(r"/students/(\d+)/", href)
+                if match and name:
+                    inst_id = match.group(1)
+                    if not any(i['id'] == inst_id for i in institutes):
+                        institutes.append({"id": inst_id, "name": name})
+            
+            if institutes:
+                return institutes
+            else:
+                # Статус 200, но регулярка не нашла институты
+                logging.warning(f"⚠️ Институты не найдены в HTML. Возможно, изменилась верстка главной страницы: {url}")
+                return FALLBACK_INSTITUTES
+
     except Exception as e:
-        logging.error(f"Ошибка парсинга институтов: {e}")
+        logging.error(f"❌ Ошибка получения списка институтов: {e}")
         
+    # Если произошла любая ошибка (таймаут, сбой сети), возвращаем запасной список
     return FALLBACK_INSTITUTES
+
 
 async def fetch_groups_by_institute(inst_id: str):
     """Парсит группы конкретного института с расширенным логированием"""
