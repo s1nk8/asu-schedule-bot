@@ -3,7 +3,6 @@ import logging
 import os
 import re
 import sys
-from typing import Optional
 from urllib.parse import quote
 
 from aiohttp import web
@@ -19,7 +18,6 @@ from aiogram.types import (
 from bs4 import BeautifulSoup
 import httpx
 
-# Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -27,29 +25,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Конфигурация
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8639721738:AAEX_xUw7rtNLCVCFys2ng9zAWFjgO74NjU")
 BASE_URL = "https://www.asu.ru"
 TIMETABLE_URL = f"{BASE_URL}/timetable/"
-SEARCH_URL = f"{BASE_URL}/timetable/search/"
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "Accept": "text/html,application/xhtml+xml",
-    "Accept-Language": "ru-RU,ru;q=0.9",
-}
+HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-# Инициализация бота
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Популярные группы
 POPULAR_GROUPS = [
-    "9.501-1", "9.501-2", "9.502-1", "9.502-2",
-    "4.101-1", "4.101-2", "4.102-1", "4.102-2",
-    "1.201-1", "1.201-2", "1.202-1", "1.202-2",
-    "5.301-1", "5.301-2", "5.302-1", "5.302-2",
-    "8.401-1", "8.401-2", "8.402-1", "8.402-2",
+    "9.501-1", "9.501-2", "9.502-1", "4.101-1", "4.101-2",
+    "1.201-1", "1.201-2", "5.301-1", "8.401-1", "8.401-2",
 ]
 
 def get_main_keyboard():
@@ -62,86 +49,34 @@ def get_main_keyboard():
         resize_keyboard=True,
     )
 
-def get_search_menu():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🎓 Студенты", callback_data="search_students")],
-            [InlineKeyboardButton(text="👨‍🏫 Преподаватели", callback_data="search_teachers")],
-            [InlineKeyboardButton(text="🏛 Аудитории", callback_data="search_rooms")],
-        ]
-    )
-
-async def fetch_url(url, timeout=10):
-    """Загрузка URL"""
+async def search_group_url(query: str) -> str | None:
+    """Ищет URL страницы группы через поиск сайта"""
     try:
-        async with httpx.AsyncClient(
-            follow_redirects=True,
-            headers=HEADERS,
-            timeout=timeout,
-            verify=False
-        ) as client:
-            response = await client.get(url)
-            if response.status_code == 200:
-                return response.text
-            else:
-                logger.error(f"HTTP {response.status_code} for {url}")
+        url = f"{BASE_URL}/timetable/search/students/?query={quote(query)}"
+        
+        async with httpx.AsyncClient(follow_redirects=True, headers=HEADERS, timeout=10) as client:
+            r = await client.get(url)
+            
+            if r.status_code != 200:
                 return None
+            
+            soup = BeautifulSoup(r.text, 'html.parser')
+            
+            # Ищем ссылку на группу
+            for link in soup.find_all('a', href=True):
+                if query in link.get_text() and '/timetable/students/' in link.get('href', ''):
+                    return BASE_URL + link.get('href')
+            
+            return None
     except Exception as e:
-        logger.error(f"Error fetching {url}: {e}")
+        logger.error(f"Search error: {e}")
         return None
 
-async def get_schedule(query: str):
-    """Получение расписания"""
-    # Пробуем прямой URL
-    url = f"{BASE_URL}/timetable/?group={quote(query)}"
-    html = await fetch_url(url)
-    
-    if not html:
-        return None
-    
-    soup = BeautifulSoup(html, 'html.parser')
-    for tag in soup(["script", "style", "nav", "header", "footer"]):
-        tag.decompose()
-    
-    # Ищем таблицы
-    tables = soup.find_all('table')
-    if tables:
-        result = []
-        for table in tables[:3]:
-            for row in table.find_all('tr')[:30]:
-                cells = [c.get_text(strip=True) for c in row.find_all(['td', 'th'])]
-                if cells:
-                    result.append(' | '.join(cells))
-        if result:
-            return '\n'.join(result)
-    
-    # Ищем div с расписанием
-    for div in soup.find_all('div', class_=True):
-        classes = ' '.join(div.get('class', []))
-        if any(w in classes.lower() for w in ['timetable', 'schedule', 'day', 'rasp']):
-            text = div.get_text(separator='\n', strip=True)
-            if len(text) > 30:
-                return text[:2000]
-    
-    # Берем весь текст
-    body = soup.find('body') or soup
-    text = body.get_text(separator='\n', strip=True)
-    lines = [line.strip() for line in text.split('\n') if line.strip() and len(line) > 10]
-    
-    # Ищем строки с query
-    relevant = [line for line in lines if query.lower() in line.lower()]
-    if relevant:
-        return '\n'.join(relevant[:30])
-    
-    # Возвращаем первые строки
-    return '\n'.join(lines[:20]) if lines else None
-
-# Обработчики команд
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
     await message.answer(
         "👋 <b>Бот расписания АлтГУ</b>\n\n"
-        "Отправьте номер группы, например:\n"
+        "Отправьте номер группы:\n"
         "<code>9.501-1</code>\n\n"
         "Или используйте кнопки меню.",
         parse_mode="HTML",
@@ -151,8 +86,12 @@ async def cmd_start(message: types.Message):
 @dp.message(F.text == "🔍 Найти расписание")
 async def btn_search(message: types.Message):
     await message.answer(
-        "Отправьте номер группы, фамилию преподавателя или аудиторию:",
-        reply_markup=get_search_menu()
+        "Отправьте номер группы, фамилию преподавателя или аудиторию.\n\n"
+        "<b>Примеры:</b>\n"
+        "• <code>9.501-1</code>\n"
+        "• <code>Иванов</code>\n"
+        "• <code>327М</code>",
+        parse_mode="HTML"
     )
 
 @dp.message(F.text == "📋 Популярные группы")
@@ -175,40 +114,24 @@ async def cb_group(callback: CallbackQuery):
     await callback.answer()
     group = callback.data.replace("g_", "")
     
-    await callback.message.edit_text(f"⏳ Поиск группы <b>{group}</b>...", parse_mode="HTML")
+    await callback.message.edit_text(f"⏳ Ищу группу <b>{group}</b>...", parse_mode="HTML")
     
-    result = await get_schedule(group)
+    group_url = await search_group_url(group)
     
-    if result:
-        try:
-            await callback.message.edit_text(
-                f"📅 <b>{group}</b>\n\n<pre>{result[:3500]}</pre>",
-                parse_mode="HTML"
-            )
-        except:
-            await callback.message.delete()
-            for i in range(0, len(result), 3500):
-                await callback.message.answer(f"<pre>{result[i:i+3500]}</pre>", parse_mode="HTML")
+    if group_url:
+        await callback.message.edit_text(
+            f"📅 <b>Группа {group}</b>\n\n"
+            f"🔗 <a href='{group_url}'>Открыть расписание на сайте АлтГУ</a>\n\n"
+            f"<i>Нажмите на ссылку, чтобы посмотреть расписание.</i>",
+            parse_mode="HTML",
+            disable_web_page_preview=False
+        )
     else:
         await callback.message.edit_text(
-            f"❌ Расписание для <b>{group}</b> не найдено.",
+            f"❌ Группа <b>{group}</b> не найдена.\n"
+            f"Попробуйте открыть сайт: {TIMETABLE_URL}",
             parse_mode="HTML"
         )
-
-@dp.callback_query(F.data == "search_students")
-async def cb_students(callback: CallbackQuery):
-    await callback.answer()
-    await callback.message.edit_text("🎓 Отправьте номер группы:")
-
-@dp.callback_query(F.data == "search_teachers")
-async def cb_teachers(callback: CallbackQuery):
-    await callback.answer()
-    await callback.message.edit_text("👨‍🏫 Отправьте фамилию преподавателя:")
-
-@dp.callback_query(F.data == "search_rooms")
-async def cb_rooms(callback: CallbackQuery):
-    await callback.answer()
-    await callback.message.edit_text("🏛 Отправьте номер аудитории:")
 
 @dp.message(F.text == "🌐 Сайт АлтГУ")
 async def btn_website(message: types.Message):
@@ -218,55 +141,45 @@ async def btn_website(message: types.Message):
 async def btn_help(message: types.Message):
     await message.answer(
         "<b>📚 Помощь:</b>\n\n"
-        "Просто отправьте боту:\n"
-        "• <code>9.501-1</code> - группа\n"
-        "• <code>Иванов</code> - преподаватель\n"
-        "• <code>327М</code> - аудитория\n\n"
-        "Или используйте кнопки меню.",
+        "Отправьте боту номер группы, например:\n"
+        "<code>9.501-1</code>\n\n"
+        "Бот найдёт ссылку на расписание вашей группы.",
         parse_mode="HTML"
     )
 
 @dp.message()
 async def handle_message(message: types.Message):
-    """Обработка всех текстовых сообщений"""
     query = message.text.strip()
     
-    # Пропускаем слишком короткие
     if len(query) < 2:
-        await message.answer("Отправьте номер группы (например: 9.501-1)")
         return
     
-    msg = await message.answer(f"⏳ Поиск...")
+    msg = await message.answer(f"⏳ Ищу <b>{query}</b>...", parse_mode="HTML")
     
-    result = await get_schedule(query)
+    group_url = await search_group_url(query)
     
     await msg.delete()
     
-    if result:
-        if len(result) > 3500:
-            for i in range(0, len(result), 3500):
-                await message.answer(f"<pre>{result[i:i+3500]}</pre>", parse_mode="HTML")
-        else:
-            await message.answer(
-                f"📅 <b>{query}</b>\n\n<pre>{result}</pre>",
-                parse_mode="HTML"
-            )
+    if group_url:
+        await message.answer(
+            f"📅 <b>{query}</b>\n\n"
+            f"🔗 <a href='{group_url}'>Открыть расписание на сайте АлтГУ</a>",
+            parse_mode="HTML",
+            disable_web_page_preview=False
+        )
     else:
         await message.answer(
-            f"❌ Ничего не найдено.\n"
-            f"Проверьте номер и попробуйте позже.\n"
-            f"Сайт: {TIMETABLE_URL}",
+            f"❌ <b>{query}</b> не найдено.\n\n"
+            f"🔗 Откройте сайт: {TIMETABLE_URL}",
             parse_mode="HTML"
         )
 
-# Веб-сервер
 async def handle_health(request):
     return web.Response(text="OK")
 
 async def start_web_server():
     app = web.Application()
     app.router.add_get("/", handle_health)
-    app.router.add_get("/health", handle_health)
     
     runner = web.AppRunner(app)
     await runner.setup()
@@ -274,29 +187,11 @@ async def start_web_server():
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    logger.info(f"Web server on port {port}")
 
 async def main():
     logger.info("Starting bot...")
-    
-    # Запускаем веб-сервер
     await start_web_server()
-    
-    # Запускаем бота
-    logger.info("Starting polling...")
-    
-    try:
-        await dp.start_polling(bot)
-    except Exception as e:
-        logger.error(f"Polling error: {e}")
-        # Ждем и пробуем снова
-        await asyncio.sleep(5)
-        await dp.start_polling(bot)
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Bot stopped")
-    except Exception as e:
-        logger.error(f"Fatal: {e}")
+    asyncio.run(main())
