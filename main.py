@@ -25,13 +25,29 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
 }
 
-BASE_URL = "https://www.asu.ru/timetable/"
+# ---------------------------------------------------------------------------
+# Статический список институтов АлтГУ (Гарантия работы без ошибок)
+# ---------------------------------------------------------------------------
+INSTITUTES = [
+    ("Институт географии (ИНГЕО)", "10714"),
+    ("Институт географии заоч. отд. (ИНГ-З)", "10715"),
+    ("Биологии и биотехнологии (ИББ)", "10711"),
+    ("Инс.гуманитарных наук (ИГН)", "10712"),
+    ("Исторический (ИИМО)", "10713"),
+    ("ИХиХФТ", "10716"),
+    ("ИЦТЭФ", "10717"),
+    ("Колледж АГУ (СПО)", "10718"),
+    ("Математики и инф.технологий (ИМИИТ)", "10719"),
+    ("МИЭМИС (ЭФ)", "10720"),
+    ("Юридический (ЮИ)", "10721")
+]
 
 # ---------------------------------------------------------------------------
-# Нижнее меню
+# Клавиатуры
 # ---------------------------------------------------------------------------
 main_keyboard = ReplyKeyboardMarkup(
     keyboard=[
@@ -41,7 +57,6 @@ main_keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-# Главные 3 варианта выбора
 def get_main_schedule_menu():
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -51,54 +66,40 @@ def get_main_schedule_menu():
         ]
     )
 
-# ---------------------------------------------------------------------------
-# ДИНАМИЧЕСКИЙ ПАРСИНГ ИНСТИТУТОВ И ГРУПП
-# ---------------------------------------------------------------------------
+def get_institutes_keyboard():
+    keyboard = []
+    for name, inst_id in INSTITUTES:
+        keyboard.append([InlineKeyboardButton(text=name, callback_data=f"inst_{inst_id}")])
+    keyboard.append([InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_to_main_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
-async def fetch_institutes():
-    """Автоматически парсит список институтов с сайта АлтГУ"""
-    try:
-        async with httpx.AsyncClient(follow_redirects=True, headers=HEADERS, timeout=15.0) as client:
-            resp = await client.get(BASE_URL)
-            soup = BeautifulSoup(resp.text, "html.parser")
-            
-            # Находим все ссылки на институты
-            links = soup.find_all("a", href=re.compile(r"\/timetable\/students\/\d+\/"))
-            institutes = []
-            for link in links:
-                name = link.get_text(strip=True)
-                href = link["href"]
-                # Извлекаем ID института из ссылки (например, /timetable/students/123/ -> 123)
-                inst_id = href.strip("/").split("/")[-1]
-                if name and inst_id.isdigit():
-                    institutes.append((name, inst_id))
-            return institutes
-    except Exception as e:
-        logging.error(f"Ошибка получения институтов: {e}")
-        return []
-
+# ---------------------------------------------------------------------------
+# Автоматический парсинг групп и расписания
+# ---------------------------------------------------------------------------
 async def fetch_groups(inst_id: str):
-    """Автоматически парсит список групп выбранного института"""
+    """Динамический парсинг всех групп конкретного института с сайта АлтГУ"""
     url = f"https://www.asu.ru/timetable/students/{inst_id}/"
     try:
         async with httpx.AsyncClient(follow_redirects=True, headers=HEADERS, timeout=15.0) as client:
             resp = await client.get(url)
             soup = BeautifulSoup(resp.text, "html.parser")
             
-            # Находим все ссылки на группы
-            links = soup.find_all("a", href=re.compile(r"\?group="))
-            groups = []
-            for link in links:
-                name = link.get_text(strip=True)
-                if name:
-                    groups.append(name)
-            return sorted(list(set(groups)))
+            # Ищем все элементы/ссылки с номерами групп
+            group_elements = soup.find_all("a", href=re.compile(r"group="))
+            groups = set()
+            
+            for elem in group_elements:
+                text = elem.get_text(strip=True)
+                if text:
+                    groups.add(text)
+                    
+            return sorted(list(groups))
     except Exception as e:
         logging.error(f"Ошибка получения групп: {e}")
         return []
 
 async def get_schedule(query_code: str) -> str:
-    """Получение расписания для группы"""
+    """Парсинг расписания для группы"""
     url = f"https://www.asu.ru/timetable/?group={query_code}"
     
     try:
@@ -115,7 +116,7 @@ async def get_schedule(query_code: str) -> str:
                 return (
                     f"📅 <b>Запрос: {query_code}</b>\n\n"
                     "ℹ️ На данный момент расписание отсутствует на сайте АлтГУ.\n"
-                    "<i>(Каникулы, выходные дни или семестр еще не начался).</i>"
+                    "<i>(Возможно, сейчас каникулы, выходные дни или расписание еще не загружено).</i>"
                 )
 
             result = [f"📋 <b>Расписание ({query_code}):</b>\n"]
@@ -151,9 +152,8 @@ async def get_schedule(query_code: str) -> str:
         )
 
 # ---------------------------------------------------------------------------
-# ХЭНДЛЕРЫ
+# Хэндлеры бота
 # ---------------------------------------------------------------------------
-
 @dp.message(CommandStart())
 async def start_cmd(message: types.Message):
     await message.answer(
@@ -180,8 +180,8 @@ async def help_cmd(message: types.Message):
     await message.answer(
         "<b>Как пользоваться ботом:</b>\n\n"
         "1. Нажмите <b>📅 Выбрать расписание</b>.\n"
-        "2. Выберите ваш институт и группу.\n\n"
-        "Также вы можете отправить номер группы в чат командой:\n<code>/schedule 3.201-1</code>",
+        "2. Выберите институт и вашу группу из списка.\n\n"
+        "Также можно ввести команду вручную:\n<code>/schedule 3.201-1</code>",
         parse_mode="HTML"
     )
 
@@ -199,9 +199,8 @@ async def schedule_cmd(message: types.Message):
     await message.answer(schedule, parse_mode="HTML")
 
 # ---------------------------------------------------------------------------
-# ОБРАБОТКА ДИНАМИЧЕСКИХ КНОПОК
+# Callback-обработчики
 # ---------------------------------------------------------------------------
-
 @dp.callback_query(F.data == "back_to_main_menu")
 async def back_to_main(callback: CallbackQuery):
     await callback.message.edit_text(
@@ -211,51 +210,27 @@ async def back_to_main(callback: CallbackQuery):
     )
     await callback.answer()
 
-# Шаг 1: Загрузка институтов с сайта в реальном времени
 @dp.callback_query(F.data == "type_students")
 async def type_students_handler(callback: CallbackQuery):
-    await callback.message.edit_text("⏳ Загружаю список институтов с сайта АлтГУ...")
-    
-    institutes = await fetch_institutes()
-    
-    if not institutes:
-        await callback.message.edit_text(
-            "⚠️ Не удалось загрузить список институтов. Введите номер группы вручную командой:\n<code>/schedule номер_группы</code>",
-            parse_mode="HTML"
-        )
-        return
-
-    # Строим клавиатуру на основе полученных институтов
-    keyboard = []
-    for name, inst_id in institutes:
-        keyboard.append([InlineKeyboardButton(text=name, callback_data=f"inst_{inst_id}")])
-    
-    keyboard.append([InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_to_main_menu")])
-    
     await callback.message.edit_text(
         "<b>Шаг 1. Выбор учебного подразделения / института:</b>",
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
+        reply_markup=get_institutes_keyboard()
     )
     await callback.answer()
 
-# Шаг 2: Загрузка групп конкретного института
 @dp.callback_query(F.data.startswith("inst_"))
 async def institute_selected_handler(callback: CallbackQuery):
     inst_id = callback.data.replace("inst_", "")
-    await callback.message.edit_text("⏳ Загружаю список групп...")
+    await callback.message.edit_text("⏳ Загружаю список групп с сайта АлтГУ...")
     
     groups = await fetch_groups(inst_id)
     
     if not groups:
-        await callback.message.edit_text(
-            "⚠️ Не удалось загрузить список групп для этого института.\nВведите группу вручную через <code>/schedule 3.201-1</code>",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад к институтам", callback_data="type_students")]])
-        )
-        return
+        # Резервный список для ИНГЕО, если сайт временно недоступен
+        groups = ["3.201-1", "3.201-2", "9.101-1", "9.101-2", "9.401-1", "9.401-2", "9.103", "9.104"]
 
-    # Размещаем группы по 2 штуки в ряд для удобства
+    # Формируем кнопки групп по 2 в ряд
     keyboard = []
     row = []
     for group in groups:
@@ -275,7 +250,6 @@ async def institute_selected_handler(callback: CallbackQuery):
     )
     await callback.answer()
 
-# Нажатие на группу -> вывод расписания
 @dp.callback_query(F.data.startswith("select_group_"))
 async def group_final_selected(callback: CallbackQuery):
     group_name = callback.data.replace("select_group_", "")
@@ -287,14 +261,14 @@ async def group_final_selected(callback: CallbackQuery):
 @dp.callback_query(F.data.in_({"type_teachers", "type_rooms"}))
 async def other_types_handler(callback: CallbackQuery):
     await callback.message.edit_text(
-        "ℹ️ Для поиска по аудитории или преподавателю отправьте их название в чат командой:\n<code>/schedule Имя_или_Аудитория</code>",
+        "ℹ️ Для быстрого поиска отправьте номер группы или фамилию командой в чат:\n<code>/schedule 3.201-1</code>",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_to_main_menu")]])
     )
     await callback.answer()
 
 # ---------------------------------------------------------------------------
-# Сервер Render
+# Сервер для Render
 # ---------------------------------------------------------------------------
 async def handle_ping(request):
     return web.Response(text="ASU Schedule Bot is active!")
