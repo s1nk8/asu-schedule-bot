@@ -242,7 +242,6 @@ async def get_schedule(query_code: str) -> str:
 
       soup = BeautifulSoup(response.text, "html.parser")
 
-      # Сначала пробуем стандартные дни, если они есть
       days = soup.find_all("div", class_="day") or soup.find_all(
           "div", class_="timetable-day"
       )
@@ -250,8 +249,10 @@ async def get_schedule(query_code: str) -> str:
       if days:
         result = [f"📋 <b>Расписание ({query_code}):</b>\n"]
         has_lessons = False
-        for day in days[:7]:  шире охват дней
-          date_header = day.find(["h3", "h4", "div"], class_=["date", "day-header"])
+        for day in days[:7]:
+          date_header = day.find(
+              ["h3", "h4", "div"], class_=["date", "day-header"]
+          )
           header_text = (
               date_header.get_text(strip=True) if date_header else "День"
           )
@@ -269,11 +270,9 @@ async def get_schedule(query_code: str) -> str:
         if has_lessons:
           return "\n".join(result)
 
-      # УНИВЕРСАЛЬНЫЙ РЕЖИМ (если верстка изменилась или запрашивается аудитория/преподаватель)
       results = []
-      query_lower = query.strip().lower()
+      query_lower = query_code.strip().lower()
 
-      # Ищем по табличным строкам и блокам расписания
       for element in soup.find_all(["tr", "div", "p", "li"]):
         text = element.get_text(separator=" ", strip=True)
         if query_lower in text.lower() and len(text) < 300:
@@ -283,7 +282,7 @@ async def get_schedule(query_code: str) -> str:
       if results:
         unique_results = list(dict.fromkeys(results))
         response_text = (
-            f"📅 <b>Результаты для:</b> <code>{query}</code>\n\n"
+            f"📅 <b>Результаты для:</b> <code>{query_code}</code>\n\n"
             + "\n".join([f"▫️ {item}" for item in unique_results[:15]])
         )
         return response_text
@@ -472,7 +471,7 @@ async def ignore_callback(callback: CallbackQuery):
 
 
 # ---------------------------------------------------------------------------
-# Веб-сервер для поддержания работы на Render
+# Веб-сервер для поддержания работы на Render / Amvera
 # ---------------------------------------------------------------------------
 async def handle_ping(request):
   return web.Response(text="ASU Schedule Bot is active!")
