@@ -87,25 +87,34 @@ async def fetch_institutes():
     return FALLBACK_INSTITUTES
 
 async def fetch_groups_by_institute(inst_id: str):
-    """Парсит группы конкретного института"""
+    """Парсит группы конкретного института с расширенным логированием"""
     url = f"https://www.asu.ru/timetable/students/{inst_id}/"
     try:
         async with httpx.AsyncClient(follow_redirects=True, headers=HEADERS, timeout=10.0) as client:
             response = await client.get(url)
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.text, "html.parser")
-                groups = []
+            
+            # Логируем статус-код, если он не 200
+            if response.status_code != 200:
+                logging.error(f"❌ Ошибка доступа к {url}. Статус код: {response.status_code}")
+                return []
+
+            soup = BeautifulSoup(response.text, "html.parser")
+            groups = []
+            
+            group_links = soup.find_all("a", href=re.compile(r"\?group="))
+            for link in group_links:
+                g_name = link.get_text(strip=True)
+                if g_name and g_name not in groups:
+                    groups.append(g_name)
+                    
+            if groups:
+                return sorted(groups)
+            else:
+                # Если страница загрузилась (200), но групп нет — значит поменялась верстка
+                logging.warning(f"⚠️ Группы не найдены в HTML. Возможно, изменилась верстка сайта: {url}")
                 
-                group_links = soup.find_all("a", href=re.compile(r"\?group="))
-                for link in group_links:
-                    g_name = link.get_text(strip=True)
-                    if g_name and g_name not in groups:
-                        groups.append(g_name)
-                        
-                if groups:
-                    return sorted(groups)
     except Exception as e:
-        logging.error(f"Ошибка получения групп: {e}")
+        logging.error(f"❌ Ошибка получения групп: {e}")
         
     return []
 
