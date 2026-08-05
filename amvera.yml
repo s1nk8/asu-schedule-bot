@@ -1,12 +1,6 @@
-amvera:
-  cpu: 0.1
-  memory: 100M
-  storage: 2G
+runtime: python311
 build:
-  language: python
-  packageManager: pip
-  startupCommand: python main.py
+  command: pip install -r requirements.txt
 run:
-  persistence:,
-    - mount: /data
-      path: /data
+  command: python bot.py
+  port: 8080
