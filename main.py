@@ -4,7 +4,10 @@ import os
 import re
 import sys
 import time
+from io import BytesIO
 from typing import Dict, List, Optional
+from urllib.parse import quote, unquote
+
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command, CommandStart
@@ -14,9 +17,11 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     KeyboardButton,
     ReplyKeyboardMarkup,
+    BufferedInputFile,
 )
 from bs4 import BeautifulSoup
 import httpx
+from PIL import Image, ImageDraw, ImageFont
 
 # Настройка логирования
 logging.basicConfig(
@@ -30,55 +35,64 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8639721738:AAEX_xUw7rtNLCVCFys2ng9zAWFjgO74NjU")
 BASE_URL = "https://www.asu.ru"
 TIMETABLE_URL = f"{BASE_URL}/timetable/"
+SEARCH_URL = f"{BASE_URL}/timetable/search/"
 
-# Заголовки для имитации браузера
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "Accept": "text/html,application/xhtml+xml",
-    "Accept-Language": "ru-RU,ru;q=0.9",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ru-RU,ru;q=0.8",
 }
 
-# Инициализация бота с базовыми настройками
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Кэширование
-class Cache:
-    def __init__(self):
-        self.institutes = []
-        self.groups = {}
-        self.last_update = {}
-        self.cache_ttl = 1800  # 30 минут
-    
-    def is_valid(self, key):
-        return key in self.last_update and (time.time() - self.last_update[key]) < self.cache_ttl
-    
-    def update(self, key):
-        self.last_update[key] = time.time()
+# Запасной список институтов (так как сайт не отдаёт их напрямую)
+INSTITUTES = [
+    {"id": "1", "name": "Институт математики и информационных технологий (ИМИТ)"},
+    {"id": "2", "name": "Институт гуманитарных наук (ИГН)"},
+    {"id": "3", "name": "Институт географии (ИНГЕО)"},
+    {"id": "4", "name": "Юридический институт (ЮИ)"},
+    {"id": "5", "name": "Институт истории и международных отношений (ИИМО)"},
+    {"id": "6", "name": "Институт биологии и биотехнологии (ИББ)"},
+    {"id": "7", "name": "Институт химии и химико-фармацевтических технологий (ИХиХФТ)"},
+    {"id": "8", "name": "Институт цифровых технологий, электроники и физики (ИЦТЭФ)"},
+    {"id": "9", "name": "Международный институт экономики, менеджмента и информационных систем (МИЭМИС)"},
+    {"id": "10", "name": "Колледж АлтГУ"},
+]
 
-cache = Cache()
+# Популярные группы для быстрого выбора
+POPULAR_GROUPS = [
+    "9.501-1", "9.501-2", "9.502-1", "9.502-2",
+    "4.101-1", "4.101-2", "4.102-1", "4.102-2",
+    "1.201-1", "1.201-2", "1.202-1", "1.202-2",
+    "5.301-1", "5.301-2", "5.302-1", "5.302-2",
+    "8.401-1", "8.401-2", "8.402-1", "8.402-2",
+    "3.001-1", "3.001-2", "6.101-1", "6.101-2",
+]
 
-# Клавиатуры
 def get_main_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="📅 Расписание")],
+            [KeyboardButton(text="🔍 Найти расписание")],
+            [KeyboardButton(text="📋 Популярные группы")],
             [KeyboardButton(text="🌐 Сайт АлтГУ"), KeyboardButton(text="❓ Помощь")],
         ],
         resize_keyboard=True,
     )
 
-def get_schedule_menu():
+def get_search_menu():
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🎓 Студенты", callback_data="type_students")],
-            [InlineKeyboardButton(text="👨‍🏫 Преподаватели", callback_data="type_teachers")],
-            [InlineKeyboardButton(text="🏛 Аудитории", callback_data="type_rooms")],
+            [InlineKeyboardButton(text="🎓 Студенты", callback_data="search_students")],
+            [InlineKeyboardButton(text="👨‍🏫 Преподаватели", callback_data="search_teachers")],
+            [InlineKeyboardButton(text="🏛 Аудитории", callback_data="search_rooms")],
         ]
     )
 
 async def fetch_url(url, timeout=15):
-    """Простая загрузка URL"""
+    """Загрузка URL с задержкой между запросами"""
+    await asyncio.sleep(0.5)  # Защита от 429
+    
     try:
         async with httpx.AsyncClient(
             follow_redirects=True,
@@ -96,264 +110,306 @@ async def fetch_url(url, timeout=15):
         logger.error(f"Error fetching {url}: {e}")
         return None
 
-def is_group_name(text):
-    """Проверка, является ли текст названием группы"""
-    if not text or len(text) < 3 or len(text) > 20:
-        return False
+async def search_timetable(query: str, search_type: str = "students"):
+    """Поиск расписания через поисковую форму сайта"""
+    logger.info(f"Searching: {query} (type: {search_type})")
     
-    # Исключаем явно не группы
-    exclude_words = ['http', 'www', 'javascript', 'mailto', 'tel:', 'api', 'json', 'xml']
-    for word in exclude_words:
-        if word in text.lower():
-            return False
-    
-    # Группа должна содержать цифры
-    if not re.search(r'\d', text):
-        return False
-    
-    # Типичные паттерны групп АлтГУ: 9.501-1, 4.101-2 и т.д.
-    if re.match(r'^\d+\.\d+[-.]?\d*$', text):
-        return True
-    
-    # Если есть цифры и буквы/дефисы
-    if re.search(r'[а-яА-Яa-zA-Z]', text) and len(text) < 15:
-        return True
-    
-    return False
-
-async def fetch_institutes():
-    """Получение списка институтов"""
-    if cache.is_valid("institutes") and cache.institutes:
-        return cache.institutes
-    
-    logger.info("Fetching institutes...")
-    html = await fetch_url(TIMETABLE_URL)
-    
-    if not html:
-        logger.warning("Failed to fetch institutes")
-        return get_fallback_institutes()
-    
-    soup = BeautifulSoup(html, 'html.parser')
-    institutes = []
-    
-    # Ищем ссылки на /timetable/students/ID/
-    for link in soup.find_all('a', href=True):
-        href = link.get('href', '')
-        if '/timetable/students/' in href:
-            match = re.search(r'/students/(\d+)/?', href)
-            if match:
-                inst_id = match.group(1)
-                name = link.get_text(strip=True)
-                if name and len(name) > 3 and len(name) < 100:
-                    if not any(i['id'] == inst_id for i in institutes):
-                        institutes.append({'id': inst_id, 'name': name})
-    
-    if institutes:
-        logger.info(f"Found {len(institutes)} institutes")
-        cache.institutes = institutes
-        cache.update("institutes")
-        return institutes
-    
-    return get_fallback_institutes()
-
-def get_fallback_institutes():
-    """Запасной список"""
-    return [
-        {"id": "1", "name": "Институт математики и ИТ"},
-        {"id": "2", "name": "Институт гуманитарных наук"},
-        {"id": "3", "name": "Институт географии"},
-        {"id": "4", "name": "Юридический институт"},
-        {"id": "5", "name": "Институт истории и международных отношений"},
-        {"id": "6", "name": "Институт биологии и биотехнологии"},
-        {"id": "7", "name": "Институт химии"},
-        {"id": "8", "name": "Институт цифровых технологий"},
-        {"id": "9", "name": "Международный институт экономики"},
-        {"id": "10", "name": "Колледж АлтГУ"},
-    ]
-
-async def fetch_groups(inst_id):
-    """Получение списка групп"""
-    cache_key = f"groups_{inst_id}"
-    if cache.is_valid(cache_key) and inst_id in cache.groups:
-        return cache.groups[inst_id]
-    
-    logger.info(f"Fetching groups for institute {inst_id}")
-    url = f"{BASE_URL}/timetable/students/{inst_id}/"
-    html = await fetch_url(url)
-    
-    if not html:
-        logger.warning(f"No HTML for institute {inst_id}")
-        return []
-    
-    soup = BeautifulSoup(html, 'html.parser')
-    groups = []
-    
-    # Ищем ТОЛЬКО ссылки, которые ведут на расписание
-    for link in soup.find_all('a', href=True):
-        href = link.get('href', '')
-        text = link.get_text(strip=True)
-        
-        # Ссылка должна вести на расписание группы
-        if 'group=' in href and text:
-            # Извлекаем название группы из ссылки
-            match = re.search(r'group=([^&]+)', href)
-            if match:
-                group_name = match.group(1)
-                # Декодируем URL
-                try:
-                    from urllib.parse import unquote
-                    group_name = unquote(group_name)
-                except:
-                    pass
-                
-                if is_group_name(group_name) and group_name not in groups:
-                    groups.append(group_name)
-            elif is_group_name(text) and text not in groups:
-                groups.append(text)
-    
-    # Очистка
-    groups = [g.strip() for g in groups if is_group_name(g.strip())]
-    groups = sorted(set(groups))
-    
-    if groups:
-        logger.info(f"Found {len(groups)} groups: {groups[:5]}...")
-        cache.groups[inst_id] = groups
-        cache.update(cache_key)
-    else:
-        logger.warning(f"No groups found for institute {inst_id}")
-    
-    return groups
-
-async def get_schedule(query):
-    """Получение расписания"""
-    logger.info(f"Getting schedule for: {query}")
-    
-    # Кодируем запрос для URL
-    from urllib.parse import quote
-    encoded_query = quote(query)
-    url = f"{BASE_URL}/timetable/?group={encoded_query}"
+    # Формируем URL для поиска
+    params = f"query={quote(query)}&search_in={search_type}"
+    url = f"{SEARCH_URL}?{params}"
     
     html = await fetch_url(url)
     
     if not html:
-        return "❌ Сервер АлтГУ временно недоступен. Попробуйте позже."
+        return None
     
     soup = BeautifulSoup(html, 'html.parser')
     
     # Удаляем скрипты и стили
-    for script in soup(["script", "style"]):
-        script.decompose()
+    for tag in soup(["script", "style"]):
+        tag.decompose()
     
-    # Ищем расписание
-    result_parts = []
+    # Ищем результаты
+    results = []
     
-    # Ищем таблицы или div с расписанием
-    schedule_blocks = soup.find_all(['div', 'table'], class_=re.compile(r'day|schedule|timetable|pair|lesson', re.I))
+    # Ищем таблицы
+    for table in soup.find_all('table'):
+        rows = table.find_all('tr')
+        table_data = []
+        for row in rows[:20]:
+            cells = row.find_all(['td', 'th'])
+            row_text = ' | '.join(c.get_text(strip=True) for c in cells if c.get_text(strip=True))
+            if row_text and len(row_text) > 5:
+                table_data.append(row_text)
+        if table_data:
+            results.append('\n'.join(table_data))
     
-    if schedule_blocks:
-        for block in schedule_blocks[:14]:
-            text = block.get_text(separator=' ', strip=True)
+    # Ищем div с расписанием
+    for div in soup.find_all('div', class_=True):
+        classes = ' '.join(div.get('class', []))
+        if any(w in classes.lower() for w in ['timetable', 'schedule', 'result', 'day', 'pair', 'lesson']):
+            text = div.get_text(separator='\n', strip=True)
             if len(text) > 20:
-                result_parts.append(text[:500])
+                results.append(text[:1000])
     
-    if result_parts:
-        result = f"📅 <b>Расписание:</b> <code>{query}</code>\n\n"
-        for i, part in enumerate(result_parts, 1):
-            result += f"<b>📌 Занятие {i}:</b>\n{part}\n\n"
-        return result
-    
-    # Если не нашли структурированное - ищем по тексту
-    body = soup.find('body')
-    if body:
+    # Если ничего не нашли, ищем весь текст
+    if not results:
+        body = soup.find('body') or soup.find('main') or soup
         text = body.get_text(separator='\n', strip=True)
-        lines = [line.strip() for line in text.split('\n') if line.strip()]
+        lines = [line.strip() for line in text.split('\n') if line.strip() and len(line) > 10]
         
-        # Ищем строки, где упоминается группа
+        # Ищем строки с query
         relevant = [line for line in lines if query.lower() in line.lower()]
-        
         if relevant:
-            result = f"📅 <b>Расписание:</b> <code>{query}</code>\n\n"
-            result += '\n'.join(relevant[:20])
-            return result
+            results.append('\n'.join(relevant[:30]))
+        else:
+            # Берем первые строки
+            results.append('\n'.join(lines[:30]))
     
-    # Пробуем найти хоть что-то похожее на расписание
-    all_text = soup.get_text(separator='\n', strip=True)
-    lines = all_text.split('\n')
-    schedule_lines = []
+    return '\n\n'.join(results[:5]) if results else None
+
+async def get_schedule_text(query: str):
+    """Получение расписания текстом"""
+    # Пробуем прямой URL
+    direct_url = f"{BASE_URL}/timetable/?group={quote(query)}"
+    html = await fetch_url(direct_url)
+    
+    if html:
+        soup = BeautifulSoup(html, 'html.parser')
+        for tag in soup(["script", "style"]):
+            tag.decompose()
+        
+        tables = soup.find_all('table')
+        if tables:
+            result = []
+            for table in tables[:3]:
+                for row in table.find_all('tr')[:20]:
+                    cells = [c.get_text(strip=True) for c in row.find_all(['td', 'th'])]
+                    result.append(' | '.join(cells))
+            return '\n'.join(result) if result else None
+    
+    # Если прямой URL не дал результатов - используем поиск
+    return await search_timetable(query, "students")
+
+def text_to_image(text: str, title: str = "") -> BytesIO:
+    """Создает изображение из текста"""
+    width = 800
+    padding = 20
+    font_size = 14
+    title_font_size = 22
+    line_height = 20
+    
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", font_size)
+        title_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", title_font_size)
+    except:
+        font = ImageFont.load_default()
+        title_font = ImageFont.load_default()
+    
+    lines = []
+    for line in text.split('\n'):
+        words = line.split(' ')
+        current = ""
+        for word in words:
+            test = current + " " + word if current else word
+            if len(test) * 7 < width - 2 * padding:
+                current = test
+            else:
+                if current:
+                    lines.append(current)
+                current = word
+        if current:
+            lines.append(current)
+    
+    height = padding * 2 + title_font_size + 30 + len(lines) * line_height + padding
+    
+    image = Image.new('RGB', (width, max(height, 100)), 'white')
+    draw = ImageDraw.Draw(image)
+    
+    if title:
+        draw.text((padding, padding), title, fill='darkblue', font=title_font)
+    
+    y = padding + title_font_size + 15
+    draw.line([(padding, y), (width - padding, y)], fill='gray', width=1)
+    y += 10
     
     for line in lines:
-        line = line.strip()
-        # Ищем строки с временем (например, "8:00", "10:15")
-        if re.search(r'\d{1,2}:\d{2}', line) and len(line) > 10:
-            schedule_lines.append(line)
+        if line.strip():
+            color = 'black'
+            if '|' in line and line.index('|') < 10:
+                color = 'darkblue'
+            draw.text((padding, y), line, fill=color, font=font)
+        y += line_height
     
-    if schedule_lines:
-        result = f"📅 <b>Возможное расписание для:</b> <code>{query}</code>\n\n"
-        result += '\n'.join(schedule_lines[:20])
-        return result
+    img_byte_arr = BytesIO()
+    image.save(img_byte_arr, format='PNG')
+    img_byte_arr.seek(0)
     
-    return (
-        f"📅 <b>Запрос:</b> <code>{query}</code>\n\n"
-        f"❌ Расписание не найдено.\n\n"
-        f"💡 <i>Проверьте правильность номера группы или попробуйте позже.</i>"
-    )
+    return img_byte_arr
 
 # Обработчики
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
-    logger.info(f"User {message.from_user.id} started")
     await message.answer(
         "👋 <b>Привет!</b> Я бот расписания АлтГУ.\n\n"
-        "Выберите действие в меню:",
+        "🔍 <b>Найти расписание</b> - поиск по группе/преподавателю/аудитории\n"
+        "📋 <b>Популярные группы</b> - быстрый выбор\n\n"
+        "Или отправьте команду:\n"
+        "<code>/search 9.501-1</code>",
         parse_mode="HTML",
         reply_markup=get_main_keyboard()
     )
 
-@dp.message(Command("help"))
-async def cmd_help(message: types.Message):
-    await message.answer(
-        "<b>📚 Помощь:</b>\n\n"
-        "<b>Через меню:</b>\n"
-        "📅 Расписание → 🎓 Студенты → Институт → Группа\n\n"
-        "<b>Прямая команда:</b>\n"
-        "<code>/schedule 9.501-1</code>\n\n"
-        "<b>Другие команды:</b>\n"
-        "/start - главное меню\n"
-        "/help - справка",
-        parse_mode="HTML"
-    )
-
-@dp.message(Command("schedule"))
-async def cmd_schedule(message: types.Message):
+@dp.message(Command("search"))
+async def cmd_search(message: types.Message):
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2:
-        await message.answer(
-            "❌ Укажите группу.\n"
-            "Пример: <code>/schedule 9.501-1</code>",
-            parse_mode="HTML"
-        )
+        await message.answer("❌ Укажите запрос.\nПример: <code>/search 9.501-1</code>", parse_mode="HTML")
         return
     
     query = parts[1].strip()
-    msg = await message.answer(f"⏳ Загружаю расписание...")
+    msg = await message.answer("⏳ Ищу расписание...")
     
-    schedule = await get_schedule(query)
+    result = await get_schedule_text(query)
     
-    try:
-        await msg.edit_text(schedule, parse_mode="HTML")
-    except:
-        await msg.delete()
-        if len(schedule) > 4000:
-            for i in range(0, len(schedule), 4000):
-                await message.answer(schedule[i:i+4000], parse_mode="HTML")
+    await msg.delete()
+    
+    if result:
+        if len(result) > 4000:
+            for i in range(0, len(result), 4000):
+                await message.answer(f"<pre>{result[i:i+4000]}</pre>", parse_mode="HTML")
         else:
-            await message.answer(schedule, parse_mode="HTML")
+            await message.answer(f"📅 <b>Результаты для:</b> <code>{query}</code>\n\n<pre>{result}</pre>", parse_mode="HTML")
+    else:
+        await message.answer(f"❌ Ничего не найдено для: <code>{query}</code>", parse_mode="HTML")
 
-@dp.message(F.text == "📅 Расписание")
-async def btn_schedule(message: types.Message):
+@dp.message(Command("image"))
+async def cmd_image(message: types.Message):
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("❌ Укажите запрос.\nПример: <code>/image 9.501-1</code>", parse_mode="HTML")
+        return
+    
+    query = parts[1].strip()
+    msg = await message.answer("⏳ Создаю изображение...")
+    
+    result = await get_schedule_text(query)
+    
+    await msg.delete()
+    
+    if result:
+        img = text_to_image(result, f"Расписание: {query}")
+        photo = BufferedInputFile(img.read(), filename="schedule.png")
+        await message.answer_photo(photo, caption=f"📅 {query}")
+    else:
+        await message.answer(f"❌ Ничего не найдено для: <code>{query}</code>", parse_mode="HTML")
+
+@dp.message(F.text == "🔍 Найти расписание")
+async def btn_search(message: types.Message):
     await message.answer(
-        "Выберите тип расписания:",
-        reply_markup=get_schedule_menu()
+        "<b>Что ищем?</b>\n\n"
+        "Отправьте номер группы, фамилию преподавателя или номер аудитории.\n\n"
+        "<b>Примеры:</b>\n"
+        "• 9.501-1\n"
+        "• Иванов И.И.\n"
+        "• 327М",
+        parse_mode="HTML",
+        reply_markup=get_search_menu()
+    )
+
+@dp.message(F.text == "📋 Популярные группы")
+async def btn_popular(message: types.Message):
+    keyboard = []
+    for i in range(0, len(POPULAR_GROUPS), 3):
+        row = []
+        for group in POPULAR_GROUPS[i:i+3]:
+            row.append(InlineKeyboardButton(text=group, callback_data=f"popular_{group}"))
+        keyboard.append(row)
+    
+    keyboard.append([InlineKeyboardButton(text="🔙 В меню", callback_data="back_to_start")])
+    
+    await message.answer(
+        "📋 <b>Популярные группы:</b>\nВыберите или отправьте свою:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
+    )
+
+@dp.callback_query(F.data.startswith("popular_"))
+async def cb_popular(callback: CallbackQuery):
+    await callback.answer()
+    group = callback.data.replace("popular_", "")
+    
+    await callback.message.edit_text(f"⏳ Ищу расписание группы {group}...")
+    
+    result = await get_schedule_text(group)
+    
+    if result:
+        try:
+            await callback.message.edit_text(
+                f"📅 <b>{group}</b>\n\n<pre>{result[:4000]}</pre>",
+                parse_mode="HTML"
+            )
+        except:
+            await callback.message.delete()
+            for i in range(0, len(result), 4000):
+                await callback.message.answer(f"<pre>{result[i:i+4000]}</pre>", parse_mode="HTML")
+    else:
+        await callback.message.edit_text(
+            f"❌ Расписание для {group} не найдено.\nПопробуйте другой номер группы.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_start")]
+            ])
+        )
+
+@dp.callback_query(F.data == "search_students")
+async def cb_search_students(callback: CallbackQuery):
+    await callback.answer()
+    await callback.message.edit_text(
+        "🎓 <b>Поиск расписания студентов</b>\n\n"
+        "Отправьте номер группы:\n"
+        "<code>9.501-1</code>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_start")]
+        ])
+    )
+
+@dp.callback_query(F.data == "search_teachers")
+async def cb_search_teachers(callback: CallbackQuery):
+    await callback.answer()
+    await callback.message.edit_text(
+        "👨‍🏫 <b>Поиск преподавателя</b>\n\n"
+        "Отправьте фамилию:\n"
+        "<code>Иванов</code> или <code>Иванов И.И.</code>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_start")]
+        ])
+    )
+
+@dp.callback_query(F.data == "search_rooms")
+async def cb_search_rooms(callback: CallbackQuery):
+    await callback.answer()
+    await callback.message.edit_text(
+        "🏛 <b>Поиск аудитории</b>\n\n"
+        "Отправьте номер:\n"
+        "<code>327М</code> или <code>215</code>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_start")]
+        ])
+    )
+
+@dp.callback_query(F.data == "back_to_start")
+async def cb_back_start(callback: CallbackQuery):
+    await callback.answer()
+    await callback.message.edit_text(
+        "Главное меню. Используйте кнопки ниже.",
+        reply_markup=None
+    )
+    await callback.message.answer(
+        "Выберите действие:",
+        reply_markup=get_main_keyboard()
     )
 
 @dp.message(F.text == "🌐 Сайт АлтГУ")
@@ -362,130 +418,61 @@ async def btn_website(message: types.Message):
 
 @dp.message(F.text == "❓ Помощь")
 async def btn_help(message: types.Message):
-    await cmd_help(message)
-
-@dp.callback_query(F.data == "type_students")
-async def cb_students(callback: CallbackQuery):
-    await callback.answer()
-    await callback.message.edit_text("⏳ Загружаю институты...")
-    
-    institutes = await fetch_institutes()
-    
-    keyboard = []
-    for inst in institutes:
-        keyboard.append([
-            InlineKeyboardButton(
-                text=inst['name'][:40],
-                callback_data=f"inst_{inst['id']}"
-            )
-        ])
-    keyboard.append([
-        InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_menu")
-    ])
-    
-    await callback.message.edit_text(
-        "🏛 <b>Выберите институт:</b>",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
-    )
-
-@dp.callback_query(F.data == "type_teachers")
-async def cb_teachers(callback: CallbackQuery):
-    await callback.answer()
-    await callback.message.edit_text(
-        "👨‍🏫 Отправьте: <code>/schedule Фамилия И.О.</code>",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_menu")]
-        ])
-    )
-
-@dp.callback_query(F.data == "type_rooms")
-async def cb_rooms(callback: CallbackQuery):
-    await callback.answer()
-    await callback.message.edit_text(
-        "🏛 Отправьте: <code>/schedule НомерАудитории</code>",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_menu")]
-        ])
-    )
-
-@dp.callback_query(F.data.startswith("inst_"))
-async def cb_institute(callback: CallbackQuery):
-    await callback.answer()
-    inst_id = callback.data.replace("inst_", "")
-    
-    await callback.message.edit_text("⏳ Загружаю группы...")
-    groups = await fetch_groups(inst_id)
-    
-    if not groups:
-        await callback.message.edit_text(
-            "❌ Группы не найдены.\n\n"
-            "Используйте ручной поиск:\n"
-            "<code>/schedule НомерГруппы</code>\n\n"
-            "Пример: <code>/schedule 9.501-1</code>",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔙 Назад", callback_data="type_students")]
-            ])
-        )
-        return
-    
-    keyboard = []
-    for i in range(0, len(groups), 2):
-        row = []
-        for group in groups[i:i+2]:
-            row.append(InlineKeyboardButton(
-                text=group[:20],
-                callback_data=f"group_{group}"
-            ))
-        keyboard.append(row)
-    keyboard.append([
-        InlineKeyboardButton(text="🔙 К институтам", callback_data="type_students")
-    ])
-    
-    await callback.message.edit_text(
-        f"👥 <b>Выберите группу:</b> (найдено {len(groups)})",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
-    )
-
-@dp.callback_query(F.data.startswith("group_"))
-async def cb_group(callback: CallbackQuery):
-    await callback.answer()
-    group = callback.data.replace("group_", "")
-    
-    await callback.message.edit_text(f"⏳ Загружаю расписание...")
-    
-    schedule = await get_schedule(group)
-    
-    try:
-        await callback.message.edit_text(schedule, parse_mode="HTML")
-    except:
-        await callback.message.delete()
-        if len(schedule) > 4000:
-            for i in range(0, len(schedule), 4000):
-                await callback.message.answer(schedule[i:i+4000], parse_mode="HTML")
-        else:
-            await callback.message.answer(schedule, parse_mode="HTML")
-
-@dp.callback_query(F.data == "back_to_menu")
-async def cb_back(callback: CallbackQuery):
-    await callback.answer()
-    await callback.message.edit_text(
-        "Выберите тип расписания:",
-        reply_markup=get_schedule_menu()
+    await message.answer(
+        "<b>📚 Помощь:</b>\n\n"
+        "<b>🔍 Найти расписание</b> - поиск\n"
+        "<b>📋 Популярные группы</b> - быстрый выбор\n\n"
+        "<b>Команды:</b>\n"
+        "/search 9.501-1 - поиск текстом\n"
+        "/image 9.501-1 - поиск картинкой\n"
+        "/start - меню\n"
+        "/help - справка",
+        parse_mode="HTML"
     )
 
 @dp.message()
-async def handle_other(message: types.Message):
-    await message.answer(
-        "Используйте меню или команды:\n"
-        "/start - главное меню\n"
-        "/schedule - поиск расписания\n"
-        "/help - справка"
-    )
+async def handle_message(message: types.Message):
+    """Обработка любых текстовых сообщений как поискового запроса"""
+    query = message.text.strip()
+    
+    # Определяем тип поиска по содержимому
+    if re.match(r'^[\d]', query):
+        search_type = "students"
+    elif re.match(r'^[А-Яа-яЁё]', query):
+        search_type = "lecturers"
+    else:
+        search_type = "students"
+    
+    msg = await message.answer(f"⏳ Ищу: <b>{query}</b>...", parse_mode="HTML")
+    
+    # Пробуем прямой URL
+    result = await get_schedule_text(query)
+    
+    # Если не нашли - пробуем поиск
+    if not result:
+        result = await search_timetable(query, search_type)
+    
+    await msg.delete()
+    
+    if result:
+        if len(result) > 4000:
+            for i in range(0, len(result), 4000):
+                await message.answer(f"<pre>{result[i:i+4000]}</pre>", parse_mode="HTML")
+        else:
+            await message.answer(
+                f"📅 <b>Результаты:</b> <code>{query}</code>\n\n<pre>{result}</pre>",
+                parse_mode="HTML"
+            )
+    else:
+        await message.answer(
+            f"❌ Ничего не найдено.\n\n"
+            f"🔍 Попробуйте:\n"
+            f"• Другой номер группы\n"
+            f"• Только фамилию преподавателя\n"
+            f"• Номер аудитории без буквы\n\n"
+            f"Или откройте сайт: {TIMETABLE_URL}",
+            parse_mode="HTML"
+        )
 
 # Веб-сервер
 async def handle_health(request):
@@ -506,11 +493,7 @@ async def start_web_server():
 
 async def main():
     logger.info("Starting bot...")
-    
-    # Запускаем веб-сервер
     await start_web_server()
-    
-    # Запускаем бота
     logger.info("Starting polling...")
     await dp.start_polling(bot)
 
