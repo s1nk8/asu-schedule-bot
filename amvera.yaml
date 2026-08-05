@@ -1,12 +1,10 @@
 meta:
   version: 1.0
-  toolchain: python
-  runtime: python311
+  toolchain: python311
 
 build:
   command: pip install -r requirements.txt
-  requirements: requirements.txt
 
 run:
-  command: python bot.py
+  command: python main.py
   port: 8080
