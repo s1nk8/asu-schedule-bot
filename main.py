@@ -16,6 +16,7 @@ from aiogram.types import (
     CallbackQuery
 )
 
+# Токен твоего бота
 BOT_TOKEN = "8639721738:AAEX_xUw7rtNLCVCFys2ng9zAWFjgO74NjU"
 
 bot = Bot(token=BOT_TOKEN)
@@ -27,7 +28,7 @@ HEADERS = {
 
 USER_GROUPS_CACHE = {}
 
-# Запасной базовый список институтов АлтГУ (если сайт временно недоступен)
+# Запасной базовый список институтов АлтГУ (если сайт временно недоступен или блокирует по IP)
 FALLBACK_INSTITUTES = [
     {"id": "3", "name": "Институт географии (ИНГЕО)"},
     {"id": "1", "name": "Биологии и биотехнологии (ИББ)"},
@@ -58,14 +59,14 @@ def get_main_schedule_menu():
         ]
     )
 
-async async def fetch_institutes():
+async def fetch_institutes():
     """Парсит институты с сайта АлтГУ с расширенным логированием и фоллбэком"""
     url = "https://www.asu.ru/timetable/"
     try:
         async with httpx.AsyncClient(follow_redirects=True, headers=HEADERS, timeout=10.0) as client:
             response = await client.get(url)
             
-            # Логируем статус-код, если он не 200
+            # Логируем статус-код, если он не 200 (например, 403 при блокировке Render)
             if response.status_code != 200:
                 logging.error(f"❌ Ошибка доступа к главной странице {url}. Статус код: {response.status_code}")
                 return FALLBACK_INSTITUTES
@@ -87,16 +88,13 @@ async async def fetch_institutes():
             if institutes:
                 return institutes
             else:
-                # Статус 200, но регулярка не нашла институты
-                logging.warning(f"⚠️ Институты не найдены в HTML. Возможно, изменилась верстка главной страницы: {url}")
+                logging.warning(f"⚠️ Институты не найдены в HTML. Возможно, изменилась верстка: {url}")
                 return FALLBACK_INSTITUTES
-
+                
     except Exception as e:
         logging.error(f"❌ Ошибка получения списка институтов: {e}")
         
-    # Если произошла любая ошибка (таймаут, сбой сети), возвращаем запасной список
     return FALLBACK_INSTITUTES
-
 
 async def fetch_groups_by_institute(inst_id: str):
     """Парсит группы конкретного института с расширенным логированием"""
@@ -122,7 +120,6 @@ async def fetch_groups_by_institute(inst_id: str):
             if groups:
                 return sorted(groups)
             else:
-                # Если страница загрузилась (200), но групп нет — значит поменялась верстка
                 logging.warning(f"⚠️ Группы не найдены в HTML. Возможно, изменилась верстка сайта: {url}")
                 
     except Exception as e:
@@ -175,7 +172,7 @@ async def get_schedule(query_code: str) -> str:
         async with httpx.AsyncClient(follow_redirects=True, headers=HEADERS, timeout=12.0) as client:
             response = await client.get(url)
             if response.status_code != 200:
-                return "⚠️ Не удалось связаться с сервером АлтГУ."
+                return "⚠️ Не удалось связаться с сервером АлтГУ. (Возможно, сайт блокирует запросы)"
             
             soup = BeautifulSoup(response.text, "html.parser")
             days = soup.find_all("div", class_="day") or soup.find_all("div", class_="timetable-day")
@@ -205,11 +202,11 @@ async def get_schedule(query_code: str) -> str:
             return "\n".join(result)
 
     except Exception as e:
-        logging.error(f"Ошибка парсинга: {e}")
+        logging.error(f"Ошибка парсинга расписания: {e}")
         return f"📅 <b>Запрос: {query_code}</b>\n\nℹ️ Ошибка подключения к серверу АлтГУ."
 
 # ---------------------------------------------------------------------------
-# Хэндлеры
+# Хэндлеры сообщений
 # ---------------------------------------------------------------------------
 @dp.message(CommandStart())
 async def start_cmd(message: types.Message):
@@ -239,14 +236,17 @@ async def schedule_cmd(message: types.Message):
     await status_msg.delete()
     await message.answer(schedule, parse_mode="HTML")
 
-# Callback-события
+# ---------------------------------------------------------------------------
+# Callback-события (исправлен таймаут: callback.answer() стоит в начале)
+# ---------------------------------------------------------------------------
 @dp.callback_query(F.data == "back_to_main_menu")
 async def back_to_main(callback: CallbackQuery):
+    await callback.answer() # Сообщаем Telegram, что мы приняли запрос
     await callback.message.edit_text("<b>Расписание занятий АлтГУ</b>\nВыберите категорию:", parse_mode="HTML", reply_markup=get_main_schedule_menu())
-    await callback.answer()
 
 @dp.callback_query(F.data == "type_students")
 async def type_students_handler(callback: CallbackQuery):
+    await callback.answer()
     await callback.message.edit_text("⏳ Загружаю список институтов...")
     institutes = await fetch_institutes()
     await callback.message.edit_text(
@@ -254,10 +254,10 @@ async def type_students_handler(callback: CallbackQuery):
         parse_mode="HTML",
         reply_markup=build_institutes_keyboard(institutes)
     )
-    await callback.answer()
 
 @dp.callback_query(F.data == "type_teachers")
 async def type_teachers_handler(callback: CallbackQuery):
+    await callback.answer()
     await callback.message.edit_text(
         "👨‍🏫 <b>Поиск расписания преподавателя</b>\n\n"
         "Для просмотра расписания отправьте команду со структурой:\n"
@@ -265,10 +265,10 @@ async def type_teachers_handler(callback: CallbackQuery):
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main_menu")]])
     )
-    await callback.answer()
 
 @dp.callback_query(F.data == "type_rooms")
 async def type_rooms_handler(callback: CallbackQuery):
+    await callback.answer()
     await callback.message.edit_text(
         "🏛 <b>Поиск расписания в аудитории</b>\n\n"
         "Для просмотра расписания отправьте номер аудитории командой:\n"
@@ -276,10 +276,10 @@ async def type_rooms_handler(callback: CallbackQuery):
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main_menu")]])
     )
-    await callback.answer()
 
 @dp.callback_query(F.data.startswith("inst_"))
 async def inst_selected_handler(callback: CallbackQuery):
+    await callback.answer()
     inst_id = callback.data.split("_")[1]
     await callback.message.edit_text("⏳ Загружаю список групп института...")
     groups = await fetch_groups_by_institute(inst_id)
@@ -291,12 +291,10 @@ async def inst_selected_handler(callback: CallbackQuery):
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад к институтам", callback_data="type_students")]])
         )
-        await callback.answer()
         return
 
     USER_GROUPS_CACHE[callback.from_user.id] = groups
     await callback.message.edit_text("<b>Шаг 2. Выбор группы:</b>", parse_mode="HTML", reply_markup=build_groups_keyboard(groups, page=0))
-    await callback.answer()
 
 @dp.callback_query(F.data.startswith("page_"))
 async def page_change_handler(callback: CallbackQuery):
@@ -305,22 +303,24 @@ async def page_change_handler(callback: CallbackQuery):
     if not groups:
         await callback.answer("Сессия истекла. Попробуйте выбрать институт заново.", show_alert=True)
         return
-    await callback.message.edit_text("<b>Шаг 2. Выбор группы:</b>", parse_mode="HTML", reply_markup=build_groups_keyboard(groups, page=page))
     await callback.answer()
+    await callback.message.edit_text("<b>Шаг 2. Выбор группы:</b>", parse_mode="HTML", reply_markup=build_groups_keyboard(groups, page=page))
 
 @dp.callback_query(F.data.startswith("select_group_"))
 async def group_final_selected(callback: CallbackQuery):
+    await callback.answer()
     group_name = callback.data.replace("select_group_", "")
     await callback.message.edit_text(f"⏳ Запрашиваю расписание для группы <b>{group_name}</b>...", parse_mode="HTML")
     schedule = await get_schedule(group_name)
     await callback.message.edit_text(schedule, parse_mode="HTML")
-    await callback.answer()
 
 @dp.callback_query(F.data == "ignore")
 async def ignore_callback(callback: CallbackQuery):
     await callback.answer()
 
-# Веб-сервер для Render
+# ---------------------------------------------------------------------------
+# Веб-сервер для поддержания работы на Render
+# ---------------------------------------------------------------------------
 async def handle_ping(request):
     return web.Response(text="ASU Schedule Bot is active!")
 
